@@ -312,8 +312,8 @@ jobs:
             [ -z "$WEBHOOK_URL" ] && return 0
             case "$WEBHOOK_URL" in
               *macrodroid.com*)
-                curl -sS -m 15 -G --data-urlencode "msg=$1" \
-                  --data-urlencode "event=${2:-info}" "$WEBHOOK_URL" >/dev/null 2>&1 || true ;;
+                curl -sS -m 15 -G --data-urlencode "event=${2:-info}" \
+                  --data-urlencode "msg=$1" "$WEBHOOK_URL" >/dev/null 2>&1 || true ;;
               *)
                 PAYLOAD=$(jq -n --arg m "$1" '{content:$m, text:$m}')
                 curl -sS -m 15 -H 'Content-Type: application/json' \
@@ -524,7 +524,7 @@ jobs:
           MSG="❌ OCI provisioner run FAILED. Check the log: ${RUN_URL}"
           case "$WEBHOOK_URL" in
             *macrodroid.com*)
-              curl -sS -m 15 -G --data-urlencode "msg=$MSG" --data-urlencode "event=error" "$WEBHOOK_URL" >/dev/null 2>&1 || true ;;
+              curl -sS -m 15 -G --data-urlencode "event=error" --data-urlencode "msg=$MSG" "$WEBHOOK_URL" >/dev/null 2>&1 || true ;;
             *)
               curl -sS -m 15 -H 'Content-Type: application/json' \
                 -d "$(jq -n --arg m "$MSG" '{content:$m,text:$m}')" "$WEBHOOK_URL" >/dev/null 2>&1 || true ;;
