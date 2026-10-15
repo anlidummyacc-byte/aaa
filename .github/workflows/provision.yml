@@ -296,6 +296,24 @@ jobs:
             exit 1
           fi
 
+          # Optional Discord/Slack webhook (secret NOTIFY_WEBHOOK_URL).
+          WEBHOOK_URL="${{ secrets.NOTIFY_WEBHOOK_URL }}"
+          notify() {
+            [ -z "$WEBHOOK_URL" ] && return 0
+            case "$WEBHOOK_URL" in
+              *macrodroid.com*)
+                curl -sS -m 15 -G --data-urlencode "msg=$1" \
+                  --data-urlencode "event=${2:-info}" "$WEBHOOK_URL" >/dev/null 2>&1 || true ;;
+              *)
+                PAYLOAD=$(jq -n --arg m "$1" '{content:$m, text:$m}')
+                curl -sS -m 15 -H 'Content-Type: application/json' \
+                  -d "$PAYLOAD" "$WEBHOOK_URL" >/dev/null 2>&1 || true ;;
+            esac
+          }
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            notify "▶️ OCI provisioner started (manual run). Target: ${SHAPE}, ${OCPUS} OCPU / ${MEMORY_GBS} GB, ${REGION}." started
+          fi
+
           while [ $SECONDS -lt $end ]; do
             echo "=========================================="
             echo "=== Attempt $attempt at $(date -u) ==="
@@ -347,6 +365,7 @@ jobs:
 
               # GitHub sends the run email itself, so the success message only
               # needs to reach the Actions log. No webhook = no outbound call.
+              notify "🎉 VM created! ${SHAPE} '${DISPLAY_NAME}' in ${REGION}. Public IP: ${PUBLIC_IP:-pending (check Oracle console)}. Disable the workflow now." success
               echo "::notice title=VM provisioned::${SHAPE} '${DISPLAY_NAME}' in ${REGION}. Public IP: ${PUBLIC_IP:-pending assignment}"
               exit 0
             fi
@@ -361,6 +380,8 @@ jobs:
             else
               echo "::error::FATAL: non-capacity error. Aborting to avoid burning runtime."
               echo "$OUTPUT" | head -40
+              ERRLINE=$(printf '%s' "$OUTPUT" | grep -m1 -E '"code"|"message"|Missing|Error' | head -c 300)
+              notify "❌ OCI provisioner stopped on a non-capacity error: ${ERRLINE:-see Actions log}" error
               exit 1
             fi
 
@@ -368,4 +389,7 @@ jobs:
             sleep $(( (RANDOM % 8) + 10 ))  # Jittered 10-17s sleep
           done
 
+          case "$(date -u +%H)" in
+            00|06|12|18) notify "⏳ Still trying: no A1 capacity yet in ${REGION} (${attempt} attempts this cycle). Will keep retrying." heartbeat ;;
+          esac
           echo "⚠️ Timed out after 25 minutes without securing capacity this cycle. Will retry on next scheduled cron run."
