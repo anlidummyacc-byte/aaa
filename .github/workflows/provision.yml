@@ -5,6 +5,11 @@ on:
     # Runs every 5 minutes around the clock until capacity is caught
     - cron: '*/5 * * * *'
   workflow_dispatch:
+    inputs:
+      chained:
+        description: "Set automatically when a run starts the next one"
+        required: false
+        default: "false"
 
 # Prevents overlapping runs from hammering OCI API concurrently
 concurrency:
@@ -12,13 +17,17 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write   # saves history.log
+  actions: write    # starts the next run
 
 jobs:
   launch_instance:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
+      - name: Checkout (history log lives in the repo)
+        uses: actions/checkout@v4
+
       - name: Install OCI CLI
         uses: actions/setup-python@v5
         with:
@@ -213,6 +222,7 @@ jobs:
           echo "OK image ${IMAGE}"
 
       - name: Continuous Launch Loop
+        id: loop
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           export SUPPRESS_LABEL_WARNING=True
@@ -310,8 +320,91 @@ jobs:
                   -d "$PAYLOAD" "$WEBHOOK_URL" >/dev/null 2>&1 || true ;;
             esac
           }
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            notify "▶️ OCI provisioner started (manual run). Target: ${SHAPE}, ${OCPUS} OCPU / ${MEMORY_GBS} GB, ${REGION}." started
+          # ---------- History log (saved in the repo as history.log) ----------
+          HISTORY_FILE="history.log"
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          HIST_URL="${REPO_URL}/blob/${{ github.ref_name }}/${HISTORY_FILE}"
+          RUN_URL="${REPO_URL}/actions/runs/${{ github.run_id }}"
+
+          # One line per event:  time|type|tries|detail
+          log_event() {
+            printf '%s|%s|%s|%s\n' "$(date -u '+%Y-%m-%d %H:%M')" "$1" "${2:-0}" "${3:-}" >> "$HISTORY_FILE"
+          }
+
+          save_history() {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$HISTORY_FILE"
+            git commit -q -m "history: $1" || return 0
+            git pull -q --rebase || true
+            git push -q || echo "::warning::Could not save history.log to the repo"
+          }
+
+          # Sends the ENTIRE history.log as numbered parts ("History 3/12"). One URL or
+          # Discord message cannot hold a long history, so it is split at line ends.
+          # Oldest part first, newest last. HISTORY_MAX_PARTS secret caps it (default 20).
+          send_history() {
+            [ -z "$WEBHOOK_URL" ] && return 0
+            [ -s "$HISTORY_FILE" ] || return 0
+            local dir=/tmp/hist_parts files total max start i
+            rm -rf "$dir"; mkdir -p "$dir"
+            awk -F'|' -v dir="$dir" '
+              BEGIN { n=1; len=0; f=sprintf("%s/part_%04d", dir, n) }
+              { ic="•"; if($2=="cycle")ic="⏳"; else if($2=="success")ic="🎉"; else if($2=="error")ic="❌"; else if($2=="start")ic="▶️";
+                line=sprintf("%s %s  %s", ic, substr($1,6,11), $4);
+                if (len + length(line) + 1 > 1000 && len > 0) { close(f); n++; len=0; f=sprintf("%s/part_%04d", dir, n) }
+                print line >> f; len += length(line) + 1 }' "$HISTORY_FILE"
+            mapfile -t files < <(ls "$dir"/part_* 2>/dev/null | sort)
+            total=${#files[@]}
+            max=$(printf '%s' "${{ secrets.HISTORY_MAX_PARTS }}" | tr -d '[:space:]'); max=${max:-20}
+            case "$max" in ''|*[!0-9]*|0) max=20 ;; esac
+            start=0
+            if [ "$total" -gt "$max" ]; then start=$(( total - max )); fi
+            if [ "$start" -gt 0 ]; then
+              notify "ℹ️ History is long: skipping the oldest ${start} of ${total} parts. Full file: ${HIST_URL}" history
+            fi
+            for (( i=start; i<total; i++ )); do
+              notify "📜 History $((i+1))/${total}"$'\n'"$(cat "${files[$i]}")" history
+              sleep 2
+            done
+            return 0
+          }
+
+          # Clean multi-line message: $1 = headline, $2 = optional extra line
+          build_msg() {
+            local cycles tries first now_e first_e secs elapsed last
+            cycles=$(grep -c '|cycle|' "$HISTORY_FILE" 2>/dev/null || true)
+            tries=$(awk -F'|' '$2=="cycle"{t+=$3} END{print t+0}' "$HISTORY_FILE" 2>/dev/null || echo 0)
+            first=$(head -n 1 "$HISTORY_FILE" 2>/dev/null | cut -d'|' -f1)
+            elapsed="just started"
+            if [ -n "$first" ]; then
+              now_e=$(date -u +%s); first_e=$(date -u -d "${first} UTC" +%s 2>/dev/null || echo "$now_e")
+              secs=$(( now_e - first_e ))
+              elapsed="$(( secs / 86400 ))d $(( (secs % 86400) / 3600 ))h $(( (secs % 3600) / 60 ))m"
+            fi
+            last=$(tail -n 5 "$HISTORY_FILE" 2>/dev/null | awk -F'|' '{
+              i="•"; if($2=="cycle")i="⏳"; else if($2=="success")i="🎉"; else if($2=="error")i="❌"; else if($2=="start")i="▶️";
+              printf " %s %s  %s\n", i, substr($1,6,11), $4 }')
+            local target="${SHAPE}"
+            [ "$SHAPE" = "VM.Standard.A1.Flex" ] && target="A1 Flex · ${OCPUS} OCPU · ${MEMORY_GBS} GB"
+            printf '%s\n' \
+              "$1" \
+              "━━━━━━━━━━━━━━━" \
+              ${2:+"$2"} \
+              "🌏 Region: ${REGION}" \
+              "🖥️ Target: ${target}" \
+              "📊 Total: ${cycles:-0} cycles · ${tries:-0} tries" \
+              "🕒 Running: ${elapsed} (since ${first:-now} UTC)" \
+              "━━━━━━━━━━━━━━━" \
+              "📜 Recent:" \
+              "${last}" \
+              "🔗 Full history: ${HIST_URL}"
+          }
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.chained }}" != "true" ]; then
+            log_event start 0 "manual run started"
+            notify "$(build_msg "▶️ OCI Provisioner STARTED (manual run)")" started
+            send_history
           fi
 
           while [ $SECONDS -lt $end ]; do
@@ -365,7 +458,10 @@ jobs:
 
               # GitHub sends the run email itself, so the success message only
               # needs to reach the Actions log. No webhook = no outbound call.
-              notify "🎉 VM created! ${SHAPE} '${DISPLAY_NAME}' in ${REGION}. Public IP: ${PUBLIC_IP:-pending (check Oracle console)}. Disable the workflow now." success
+              log_event success "$((attempt))" "VM created (${SHAPE})"
+              save_history success
+              notify "$(build_msg "🎉 VM CREATED!" "🌐 Public IP: ${PUBLIC_IP:-pending (see Oracle console)}")" success
+              send_history
               echo "::notice title=VM provisioned::${SHAPE} '${DISPLAY_NAME}' in ${REGION}. Public IP: ${PUBLIC_IP:-pending assignment}"
               exit 0
             fi
@@ -381,7 +477,10 @@ jobs:
               echo "::error::FATAL: non-capacity error. Aborting to avoid burning runtime."
               echo "$OUTPUT" | head -40
               ERRLINE=$(printf '%s' "$OUTPUT" | grep -m1 -E '"code"|"message"|Missing|Error' | head -c 300)
-              notify "❌ OCI provisioner stopped on a non-capacity error: ${ERRLINE:-see Actions log}" error
+              log_event error "$((attempt))" "${ERRLINE:-see Actions log}"
+              save_history error
+              notify "$(build_msg "❌ OCI Provisioner STOPPED (real error)" "⚠️ ${ERRLINE:-see Actions log}")" error
+              send_history
               exit 1
             fi
 
@@ -389,19 +488,31 @@ jobs:
             sleep $(( (RANDOM % 8) + 10 ))  # Jittered 10-17s sleep
           done
 
-          # End of a 25-minute cycle with no capacity. Message every cycle when the
-          # NOTIFY_ALL secret is "true"; otherwise only ~4 times a day.
+          # End of a 25-minute cycle with no capacity: save it, then message.
+          # Message every cycle when the NOTIFY_ALL secret is "true"; else ~4x/day.
           LAST_ERR=$(printf '%s' "${OUTPUT:-}" | grep -m1 -oiE 'out of host capacity|TooManyRequests|LimitExceeded|InternalError' | head -1)
+          TRIES=$((attempt - 1))
+          log_event cycle "$TRIES" "${TRIES} tries · ${LAST_ERR:-no response}"
+          save_history cycle
           NOTIFY_ALL=$(printf '%s' "${{ secrets.NOTIFY_ALL }}" | tr -d '[:space:]')
-          STATUS_MSG="⏳ No capacity yet (${LAST_ERR:-no response}) in ${REGION}. ${attempt} attempts this cycle. Retrying automatically."
           if [ "$NOTIFY_ALL" = "true" ]; then
-            notify "$STATUS_MSG" heartbeat
+            notify "$(build_msg "⏳ No capacity yet - still trying")" heartbeat
+            send_history
           else
             case "$(date -u +%H)" in
-              00|06|12|18) notify "$STATUS_MSG" heartbeat ;;
+              00|06|12|18) notify "$(build_msg "⏳ No capacity yet - still trying")" heartbeat; send_history ;;
             esac
           fi
+          echo "retry=true" >> "$GITHUB_OUTPUT"
           echo "⚠️ Timed out after 25 minutes without securing capacity this cycle. Will retry on next scheduled cron run."
+
+      - name: Start next run (self-chaining, does not rely on cron)
+        if: steps.loop.outputs.retry == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run provision.yml --ref "${{ github.ref_name }}" -f chained=true \
+            || echo "::warning::Could not start the next run; the cron schedule will have to do it."
 
       - name: Notify on failure
         if: failure()
