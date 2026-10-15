@@ -274,6 +274,23 @@ jobs:
           DISPLAY_NAME=$(printf '%s' "$DISPLAY_NAME" | tr -d '[:space:]')
           BOOT_VOL_GBS=$(printf '%s' "$BOOT_VOL_GBS" | tr -d '[:space:]')
 
+          # OCIDs only use a-z and 2-7 (never 0, 1, 8, 9). A digit 1 typed in
+          # place of a lowercase L is the classic cause of CannotParseRequest.
+          OCID_RE='^ocid1\.[a-z]+\.oc1\.[a-z0-9-]*\.[a-z2-7]+$'
+          TENANCY_CFG=$(awk -F= '/^[[:space:]]*tenancy[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' ~/.oci/config)
+          if ! [[ "$COMP_ID" =~ $OCID_RE ]]; then
+            echo "::warning::COMPARTMENT_OCID secret is malformed (check digit 1 vs letter l). Using the tenancy from OCI_CONFIG instead."
+            COMP_ID="$TENANCY_CFG"
+          fi
+          for NV in "COMPARTMENT_OCID=$COMP_ID" "SUBNET_OCID=$SUBNET_ID" "IMAGE_OCID=$IMAGE"; do
+            N="${NV%%=*}"; V="${NV#*=}"
+            if ! [[ "$V" =~ $OCID_RE ]]; then
+              echo "::error::$N is malformed. OCIDs never contain the digit 1, 0, 8 or 9 - recopy it (watch for 1 vs lowercase l)."
+              exit 1
+            fi
+          done
+          echo "OCID format check passed"
+
           if ! grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2)' ~/.oci/oci_ssh.pub; then
             echo "::error::SSH_PUBLIC_KEY_B64 does not decode to a valid public key (should start with ssh-rsa or ssh-ed25519)."
             exit 1
@@ -291,7 +308,7 @@ jobs:
             # `|| true` matters: the runner uses `bash -e`, so a grep that
             # matches nothing (exit 1) would otherwise kill the whole step.
             EXISTING=$(oci compute instance list \
-              --compartment-id "${{ secrets.COMPARTMENT_OCID }}" \
+              --compartment-id "${COMP_ID}" \
               --all --output json 2>/dev/null \
               | jq -r --arg s "$SHAPE" '[.data[]? | select(.shape==$s)
                   | select(."lifecycle-state" != "TERMINATED" and ."lifecycle-state" != "TERMINATING")
