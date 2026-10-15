@@ -106,7 +106,13 @@ jobs:
           # The console only shows the short form (e.g. "AD-1"); the API needs
           # the tenancy-prefixed name (e.g. "AbCd:AP-SINGAPORE-1-AD-1"), which
           # the new console never displays. So look it up via the API instead.
-          AD="${{ secrets.AD_NAME }}"
+          AD="$(printf '%s' "${{ secrets.AD_NAME }}" | tr -d '[:space:]')"
+          if [ -z "$AD" ]; then
+            AD=$(oci iam availability-domain list \
+                   --compartment-id "${{ secrets.COMPARTMENT_OCID }}" \
+                   --query 'data[0].name' --raw-output 2>/dev/null || true)
+            [ -n "$AD" ] && echo "AD from Oracle API: ${AD}"
+          fi
           if [ -z "$AD" ]; then
             # `oci iam region-subscription list` does NOT expose AD names in
             # current CLI versions, and the tenancy-specific prefix (e.g.
@@ -152,21 +158,13 @@ jobs:
             # leave the flag off rather than guessing.
             echo "::warning::Availability domain name not resolvable; omitting the flag and letting OCI pick the default AD."
           fi
-          # Build the launch flag only when we actually resolved a name.
-          AD_FLAG=""
-          if [ -n "$AD" ]; then
-            if oci compute instance list \
-                --compartment-id "${{ secrets.COMPARTMENT_OCID }}" \
-                --availability-domain "$AD" \
-                --limit 1 >/dev/null 2>&1; then
-              AD_FLAG="--availability-domain ${AD}"
-              echo "AD=${AD}" >> "$GITHUB_ENV"
-              echo "OK availability domain ${AD}"
-            else
-              echo "::warning::AD '${AD}' was rejected; omitting the flag and letting OCI choose."
-              AD=""
-            fi
+          # The launch command REQUIRES --availability-domain.
+          if [ -z "$AD" ]; then
+            echo "::error::Could not determine the availability domain. Set the AD_NAME secret (e.g. xxxx:AP-SINGAPORE-1-AD-1)."
+            exit 1
           fi
+          echo "AD=${AD}" >> "$GITHUB_ENV"
+          echo "OK availability domain ${AD}"
 
           # --- Image ----------------------------------------------------------
           # Same problem: copying an image OCID from the console means digging
@@ -234,10 +232,10 @@ jobs:
             exit 1
           fi
           if [ -z "$AD" ]; then
-            echo "::warning::No AD name resolved; OCI will use the tenancy default availability domain."
-          else
-            AD_FLAG="--availability-domain ${AD}"
+            echo "::error::No availability domain resolved. Set the AD_NAME secret."
+            exit 1
           fi
+          AD_FLAG="--availability-domain ${AD}"
 
           DISPLAY_NAME="${{ secrets.INSTANCE_NAME }}"
           DISPLAY_NAME="${DISPLAY_NAME:-vps-arm}"
