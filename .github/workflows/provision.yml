@@ -267,6 +267,18 @@ jobs:
           # TERMINATED/TERMINATED instance should not block a new launch.
           ACTIVE_STATES="PROVISIONING|RUNNING|STARTING|STOPPING|STOPPED|REBOOTING|REBOOT_MOVING|RESIZING|PAUSED"
 
+          # Strip stray spaces/newlines that sneak in when pasting secrets.
+          COMP_ID=$(printf '%s' "${{ secrets.COMPARTMENT_OCID }}" | tr -d '[:space:]')
+          SUBNET_ID=$(printf '%s' "${{ secrets.SUBNET_OCID }}" | tr -d '[:space:]')
+          IMAGE=$(printf '%s' "$IMAGE" | tr -d '[:space:]')
+          DISPLAY_NAME=$(printf '%s' "$DISPLAY_NAME" | tr -d '[:space:]')
+          BOOT_VOL_GBS=$(printf '%s' "$BOOT_VOL_GBS" | tr -d '[:space:]')
+
+          if ! grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2)' ~/.oci/oci_ssh.pub; then
+            echo "::error::SSH_PUBLIC_KEY_B64 does not decode to a valid public key (should start with ssh-rsa or ssh-ed25519)."
+            exit 1
+          fi
+
           while [ $SECONDS -lt $end ]; do
             echo "=========================================="
             echo "=== Attempt $attempt at $(date -u) ==="
@@ -291,20 +303,16 @@ jobs:
             fi
 
             OUTPUT=$(oci compute instance launch \
-              --compartment-id "${{ secrets.COMPARTMENT_OCID }}" \
+              --compartment-id "${COMP_ID}" \
               ${AD_FLAG} \
               --shape "${SHAPE}" \
               "${SHAPE_ARGS[@]}" \
               --display-name "${DISPLAY_NAME}" \
-              --subnet-id "${{ secrets.SUBNET_OCID }}" \
+              --subnet-id "${SUBNET_ID}" \
+              --image-id "${IMAGE}" \
+              --boot-volume-size-in-gbs "${BOOT_VOL_GBS}" \
               --assign-public-ip true \
-              --assign-ipv6-ip false \
-              --assign-private-dns-record true \
               --is-pv-encryption-in-transit-enabled true \
-              --source-details "{\"sourceType\":\"image\",\"imageId\":\"${IMAGE}\",\"bootVolumeSizeInGBs\":${BOOT_VOL_GBS},\"bootVolumeVpusPerGB\":10}" \
-              --instance-options '{"areLegacyImdsEndpointsDisabled":true}' \
-              --availability-config '{"recoveryAction":"RESTORE_INSTANCE"}' \
-              --agent-config '{"areAllPluginsDisabled":false,"isManagementDisabled":false,"isMonitoringDisabled":false,"pluginsConfig":[{"desiredState":"DISABLED","name":"Vulnerability Scanning"},{"desiredState":"DISABLED","name":"OS Management Hub Agent"},{"desiredState":"DISABLED","name":"Management Agent"},{"desiredState":"ENABLED","name":"Custom Logs Monitoring"},{"desiredState":"DISABLED","name":"Compute RDMA GPU Monitoring"},{"desiredState":"ENABLED","name":"Compute Instance Monitoring"},{"desiredState":"DISABLED","name":"Compute HPC RDMA Auto-Configuration"},{"desiredState":"DISABLED","name":"Compute HPC RDMA Authentication"},{"desiredState":"ENABLED","name":"Cloud Guard Workload Protection"},{"desiredState":"DISABLED","name":"Block Volume Management"},{"desiredState":"DISABLED","name":"Bastion"}]}' \
               --ssh-authorized-keys-file ~/.oci/oci_ssh.pub 2>&1)
             STATUS=$?
 
