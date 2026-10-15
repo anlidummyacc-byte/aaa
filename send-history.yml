@@ -1,0 +1,72 @@
+name: Send history to phone (on demand)
+
+# Click "Run workflow" to push the whole history.log to your webhook right now.
+# Separate from the provisioner, so it does not wait behind its 25-minute loop.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  send:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Send history
+        env:
+          WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+          MAX_PARTS: ${{ secrets.HISTORY_MAX_PARTS }}
+          HIST_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/history.log
+        run: |
+          WEBHOOK_URL=$(printf '%s' "$WEBHOOK_URL" | tr -d '[:space:]')
+          if [ -z "$WEBHOOK_URL" ]; then echo "::error::NOTIFY_WEBHOOK_URL secret is not set."; exit 1; fi
+          if [ ! -s history.log ]; then echo "::error::history.log not found or empty. Run the provisioner first."; exit 1; fi
+
+          notify() {
+            case "$WEBHOOK_URL" in
+              *macrodroid.com*)
+                curl -sS -m 15 -G --data-urlencode "event=$2" --data-urlencode "msg=$1" "$WEBHOOK_URL" >/dev/null 2>&1 || true ;;
+              *)
+                curl -sS -m 15 -H 'Content-Type: application/json' \
+                  -d "$(jq -n --arg m "$1" '{content:$m,text:$m}')" "$WEBHOOK_URL" >/dev/null 2>&1 || true ;;
+            esac
+          }
+
+          CYCLES=$(grep -c '|cycle|' history.log || true)
+          TRIES=$(awk -F'|' '$2=="cycle"{t+=$3} END{print t+0}' history.log)
+          FIRST=$(head -n 1 history.log | cut -d'|' -f1)
+          LAST=$(tail -n 1 history.log | cut -d'|' -f1)
+
+          notify "$(printf '%s\n' \
+            "📜 OCI HISTORY (on demand)" \
+            "━━━━━━━━━━━━━━━" \
+            "📊 Total: ${CYCLES:-0} cycles · ${TRIES:-0} tries" \
+            "🕒 First: ${FIRST} UTC" \
+            "🕒 Last:  ${LAST} UTC" \
+            "🔗 Full file: ${HIST_URL}")" heartbeat
+          sleep 2
+
+          dir=/tmp/hist_parts; rm -rf "$dir"; mkdir -p "$dir"
+          awk -F'|' -v dir="$dir" '
+            BEGIN { n=1; len=0; f=sprintf("%s/part_%04d", dir, n) }
+            { ic="•"; if($2=="cycle")ic="⏳"; else if($2=="success")ic="🎉"; else if($2=="error")ic="❌"; else if($2=="start")ic="▶️";
+              line=sprintf("%s %s  %s", ic, substr($1,6,11), $4);
+              if (len + length(line) + 1 > 1000 && len > 0) { close(f); n++; len=0; f=sprintf("%s/part_%04d", dir, n) }
+              print line >> f; len += length(line) + 1 }' history.log
+
+          mapfile -t files < <(ls "$dir"/part_* | sort)
+          total=${#files[@]}
+          max=$(printf '%s' "$MAX_PARTS" | tr -d '[:space:]')
+          case "$max" in ''|*[!0-9]*|0) max=20 ;; esac
+          start=0
+          if [ "$total" -gt "$max" ]; then start=$(( total - max )); fi
+          if [ "$start" -gt 0 ]; then
+            notify "ℹ️ History is long: skipping the oldest ${start} of ${total} parts. Full file: ${HIST_URL}" history
+          fi
+          for (( i=start; i<total; i++ )); do
+            notify "📜 History $((i+1))/${total}"$'\n'"$(cat "${files[$i]}")" history
+            sleep 2
+          done
+          echo "Sent ${total} part(s) to the webhook."
