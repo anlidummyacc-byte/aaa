@@ -1,0 +1,348 @@
+name: OCI Auto Provisioner (region from OCI_CONFIG)
+
+on:
+  schedule:
+    # Runs every 5 minutes around the clock until capacity is caught
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+# Prevents overlapping runs from hammering OCI API concurrently
+concurrency:
+  group: oci-instance-launch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  launch_instance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Install OCI CLI
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install --user --quiet oci-cli
+        env:
+          PATH: ${{ env.PATH }}:${{ env.HOME }}/.local/bin
+
+      - name: Setup Credentials
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.oci
+
+          # Fail fast if a required secret was never set, instead of failing
+          # deep inside the launch loop 25 minutes later.
+          # AD_NAME and IMAGE_OCID are optional - preflight discovers them.
+          # NOTE: GitHub Actions expressions do not support dynamic secret
+          # names (secrets.${{ secrets.x }}), so each one is checked literally.
+          MISSING=""
+          [ -z "${{ secrets.OCI_CONFIG }}" ]         && MISSING="${MISSING} OCI_CONFIG"
+          [ -z "${{ secrets.OCI_KEY_FILE_B64 }}" ]   && MISSING="${MISSING} OCI_KEY_FILE_B64"
+          [ -z "${{ secrets.SSH_PUBLIC_KEY_B64 }}" ]  && MISSING="${MISSING} SSH_PUBLIC_KEY_B64"
+          [ -z "${{ secrets.COMPARTMENT_OCID }}" ]   && MISSING="${MISSING} COMPARTMENT_OCID"
+          [ -z "${{ secrets.SUBNET_OCID }}" ]        && MISSING="${MISSING} SUBNET_OCID"
+          if [ -n "$MISSING" ]; then
+            echo "::error::Required secret(s) not set:${MISSING}"
+            exit 1
+          fi
+
+          printf '%s' "${{ secrets.OCI_CONFIG }}" > ~/.oci/config
+          echo "${{ secrets.OCI_KEY_FILE_B64 }}" | base64 -d > ~/.oci/key.pem
+          echo "${{ secrets.SSH_PUBLIC_KEY_B64 }}" | base64 -d > ~/.oci/oci_ssh.pub
+          chmod 600 ~/.oci/config ~/.oci/key.pem
+
+          if [ ! -s ~/.oci/key.pem ] || ! grep -q 'PRIVATE KEY' ~/.oci/key.pem; then
+            echo "::error::OCI_KEY_FILE_B64 did not decode to a PEM private key."
+            exit 1
+          fi
+          if [ ! -s ~/.oci/oci_ssh.pub ] || ! grep -q 'ssh-' ~/.oci/oci_ssh.pub; then
+            echo "::error::SSH_PUBLIC_KEY_B64 did not decode to an SSH public key."
+            exit 1
+          fi
+
+      - name: Pre-flight Checks
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+
+          REGION=$(awk -F= '/^[[:space:]]*region[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' ~/.oci/config)
+          echo "Configured region: ${REGION:-<unset>}"
+          if [ -z "$REGION" ]; then
+            echo "::error::OCI_CONFIG has no region= line."
+            exit 1
+          fi
+
+          # The single most common failure: a subnet/image OCID from a different
+          # region than the config. OCI returns a bare 404 that is easy to
+          # misread, so check the OCID region token up front.
+          for pair in "SUBNET_OCID:${{ secrets.SUBNET_OCID }}"; do
+            NAME="${pair%%:*}"; OCID="${pair#*:}"
+            # ocid1.subnet.oc1.ap-singapore-1.xxxx  ->  field 4 is the region
+            OCID_REGION=$(printf '%s' "$OCID" | cut -d. -f4)
+            if [ -z "$OCID_REGION" ]; then
+              echo "::error::${NAME} is not a valid OCID: ${OCID}"
+              exit 1
+            fi
+            if [ "$OCID_REGION" != "$REGION" ]; then
+              echo "::error::${NAME} belongs to region '${OCID_REGION}' but OCI_CONFIG says '${REGION}'."
+              echo "::error::Copy the OCID from the console with region '${REGION}' selected."
+              exit 1
+            fi
+            echo "OK ${NAME} -> ${OCID_REGION}"
+          done
+
+          # Confirm the credentials actually authenticate before entering the loop.
+          if ! oci iam region-subscription list --output json >/dev/null 2>/tmp/oci_auth_err; then
+            echo "::error::OCI authentication failed:"
+            cat /tmp/oci_auth_err
+            echo "::error::Check user/tenancy/fingerprint in OCI_CONFIG and that the API key is registered."
+            exit 1
+          fi
+          echo "OK authenticated to ${REGION}"
+
+          # --- Availability domain -------------------------------------------
+          # The console only shows the short form (e.g. "AD-1"); the API needs
+          # the tenancy-prefixed name (e.g. "AbCd:AP-SINGAPORE-1-AD-1"), which
+          # the new console never displays. So look it up via the API instead.
+          AD="${{ secrets.AD_NAME }}"
+          if [ -z "$AD" ]; then
+            # `oci iam region-subscription list` does NOT expose AD names in
+            # current CLI versions, and the tenancy-specific prefix (e.g.
+            # "AbCd:") is not guessable. So derive candidates and let the API
+            # validate each one - the first that works is correct.
+            RKEY=$(oci iam region-subscription list --output json 2>/dev/null \
+                    | jq -r --arg r "${REGION}" \
+                        'first(.data[] | select(."region-name"==$r)."region-key") // empty' \
+                    2>/dev/null || true)
+            echo "region-key=${RKEY:-unknown}"
+
+            AD=""
+            for CAND in "AD-1" "${RKEY}:AD-1" "${REGION^^}-AD-1" "${REGION^^}:AD-1"; do
+              [ -z "$CAND" ] && continue
+              if oci compute instance list \
+                   --compartment-id "${{ secrets.COMPARTMENT_OCID }}" \
+                   --availability-domain "$CAND" \
+                   --limit 1 >/dev/null 2>&1; then
+                AD="$CAND"
+                echo "AD candidate accepted: ${CAND}"
+                break
+              else
+                echo "AD candidate rejected: ${CAND}"
+              fi
+            done
+          fi
+
+          # Last resort: read the full AD name off any instance that already
+          # exists in the compartment. The tenancy prefix (e.g. "AbCd:") is
+          # random and cannot be derived, but any instance exposes it.
+          if [ -z "$AD" ]; then
+            AD=$(oci compute instance list \
+                 --compartment-id "${{ secrets.COMPARTMENT_OCID }}" \
+                 --output json 2>/dev/null \
+                 | jq -r '[.data[]?.availabilityDomain // empty][0] // empty' \
+                 2>/dev/null || true)
+            [ -n "$AD" ] && echo "AD read from an existing instance: ${AD}"
+          fi
+
+          if [ -z "$AD" ]; then
+            # Not fatal: the instance-launch API falls back to the tenancy's
+            # default AD when --availability-domain is omitted, so we simply
+            # leave the flag off rather than guessing.
+            echo "::warning::Availability domain name not resolvable; omitting the flag and letting OCI pick the default AD."
+          fi
+          # Build the launch flag only when we actually resolved a name.
+          AD_FLAG=""
+          if [ -n "$AD" ]; then
+            if oci compute instance list \
+                --compartment-id "${{ secrets.COMPARTMENT_OCID }}" \
+                --availability-domain "$AD" \
+                --limit 1 >/dev/null 2>&1; then
+              AD_FLAG="--availability-domain ${AD}"
+              echo "AD=${AD}" >> "$GITHUB_ENV"
+              echo "OK availability domain ${AD}"
+            else
+              echo "::warning::AD '${AD}' was rejected; omitting the flag and letting OCI choose."
+              AD=""
+            fi
+          fi
+
+          # --- Image ----------------------------------------------------------
+          # Same problem: copying an image OCID from the console means digging
+          # through the "Change Image" dialog. Resolve the newest Canonical
+          # Ubuntu ARM64 platform image for this region via the API instead.
+          IMAGE="${{ secrets.IMAGE_OCID }}"
+          if [ -z "$IMAGE" ]; then
+            # `oci compute image list` REQUIRES --compartment-id, and its JSON
+            # leaves `.architecture` null - the only reliable arch signal is
+            # "aarch64" inside the display-name, e.g.
+            #   Canonical-Ubuntu-24.04-aarch64-2026.09.18-0
+            # Prefer 24.04 LTS full (not Minimal), then any aarch64 Ubuntu.
+            IMGJSON=$(oci compute image list \
+                        --compartment-id "${{ secrets.COMPARTMENT_OCID }}" \
+                        --operating-system "Canonical Ubuntu" \
+                        --sort-by TIMECREATED --sort-order DESC --limit 50 \
+                        --output json 2>/dev/null || true)
+
+            IMAGE=$(printf '%s' "$IMGJSON" | jq -r \
+              '[.data[]?
+                | select((."display-name" // "") | test("aarch64"))
+                | select((."display-name" // "") | test("Minimal") | not)
+                | select((."display-name" // "") | test("24\\.04"))
+                | .id][0] // empty' 2>/dev/null || true)
+
+            if [ -z "$IMAGE" ]; then
+              IMAGE=$(printf '%s' "$IMGJSON" | jq -r \
+                '[.data[]?
+                  | select((."display-name" // "") | test("aarch64"))
+                  | select((."display-name" // "") | test("Minimal") | not)
+                  | .id][0] // empty' 2>/dev/null || true)
+            fi
+          fi
+          if [ -z "$IMAGE" ]; then
+            echo "::error::No Canonical Ubuntu aarch64 image found in ${REGION}."
+            echo "--- aarch64 images visible ---"
+            oci compute image list \
+               --compartment-id "${{ secrets.COMPARTMENT_OCID }}" \
+               --limit 200 --output json 2>/dev/null \
+               | jq -r '.data[]? | select((."display-name"//"")|test("aarch64")) | .id' \
+               2>&1 | head -10 || true
+            echo "::error::Set the IMAGE_OCID secret manually if needed."
+            exit 1
+          fi
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          echo "OK image ${IMAGE}"
+
+      - name: Continuous Launch Loop
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          export SUPPRESS_LABEL_WARNING=True
+          end=$((SECONDS + 1500))  # 25 minutes budget per scheduled run
+          attempt=1
+
+          REGION=$(awk -F= '/^[[:space:]]*region[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' ~/.oci/config)
+
+          # Discovered by the Pre-flight step and passed in via $GITHUB_ENV.
+          IMAGE="${{ env.IMAGE }}"
+          AD="${{ env.AD }}"
+
+          # IMAGE is mandatory; AD is not - the launch API picks the tenancy's
+          # default AD when --availability-domain is omitted.
+          if [ -z "$IMAGE" ]; then
+            echo "::error::Preflight did not resolve an image. Check the Pre-flight step output."
+            exit 1
+          fi
+          if [ -z "$AD" ]; then
+            echo "::warning::No AD name resolved; OCI will use the tenancy default availability domain."
+          else
+            AD_FLAG="--availability-domain ${AD}"
+          fi
+
+          DISPLAY_NAME="${{ secrets.INSTANCE_NAME }}"
+          DISPLAY_NAME="${DISPLAY_NAME:-vps-arm}"
+
+          # Target shape. Default A1 Flex (ARM, Always Free). If your region has
+          # no A1 capacity, set the SHAPE secret to VM.Standard.E2.1.Micro (x86)
+          # and leave OCPUS/MEMORY_GBS empty - E2.1.Micro rejects --shape-config.
+          SHAPE="${{ secrets.SHAPE }}"
+          SHAPE="${SHAPE:-VM.Standard.A1.Flex}"
+
+          # Always Free A1 allowance is 2 OCPUs / 12 GB TOTAL (halved 2026-06-15).
+          # Keep these at or below that or the instance is billed / terminated.
+          OCPUS="${{ secrets.OCPUS }}"
+          OCPUS="${OCPUS:-2}"
+
+          MEMORY_GBS="${{ secrets.MEMORY_GBS }}"
+          MEMORY_GBS="${MEMORY_GBS:-12}"
+
+          # E2.1.Micro is a fixed shape - it must not receive --shape-config.
+          SHAPE_ARGS=()
+          if [ "$SHAPE" = "VM.Standard.A1.Flex" ]; then
+            SHAPE_ARGS=(--shape-config "{\"ocpus\":${OCPUS},\"memoryInGBs\":${MEMORY_GBS}}")
+          fi
+
+          BOOT_VOL_GBS="${{ secrets.BOOT_VOLUME_GBS }}"
+          BOOT_VOL_GBS="${BOOT_VOL_GBS:-100}"
+
+          # States that mean an instance already exists or is on its way. Only a
+          # TERMINATED/TERMINATED instance should not block a new launch.
+          ACTIVE_STATES="PROVISIONING|RUNNING|STARTING|STOPPING|STOPPED|REBOOTING|REBOOT_MOVING|RESIZING|PAUSED"
+
+          while [ $SECONDS -lt $end ]; do
+            echo "=========================================="
+            echo "=== Attempt $attempt at $(date -u) ==="
+            echo "Target: $DISPLAY_NAME (${SHAPE}, ${OCPUS} OCPU, ${MEMORY_GBS}GB RAM, ${REGION})"
+            echo "=========================================="
+
+            set +e
+            # Check every lifecycle state, not just RUNNING, so a VM still in
+            # PROVISIONING/STARTING is not duplicated by the next cron tick.
+            # `|| true` matters: the runner uses `bash -e`, so a grep that
+            # matches nothing (exit 1) would otherwise kill the whole step.
+            EXISTING=$(oci compute instance list \
+              --compartment-id "${{ secrets.COMPARTMENT_OCID }}" \
+              --all --output json 2>/dev/null \
+              | jq -r --arg s "$SHAPE" '[.data[]? | select(.shape==$s)
+                  | select(."lifecycle-state" != "TERMINATED" and ."lifecycle-state" != "TERMINATING")
+                  | ."lifecycle-state"][0] // empty' 2>/dev/null || true)
+
+            if [ -n "$EXISTING" ]; then
+              echo "✅ SUCCESS: ${SHAPE} instance already exists in state '${EXISTING}'. Nothing to do."
+              exit 0
+            fi
+
+            OUTPUT=$(oci compute instance launch \
+              --compartment-id "${{ secrets.COMPARTMENT_OCID }}" \
+              ${AD_FLAG} \
+              --shape "${SHAPE}" \
+              "${SHAPE_ARGS[@]}" \
+              --display-name "${DISPLAY_NAME}" \
+              --subnet-id "${{ secrets.SUBNET_OCID }}" \
+              --assign-public-ip true \
+              --assign-ipv6-ip false \
+              --assign-private-dns-record true \
+              --is-pv-encryption-in-transit-enabled true \
+              --source-details "{\"sourceType\":\"image\",\"imageId\":\"${IMAGE}\",\"bootVolumeSizeInGBs\":${BOOT_VOL_GBS},\"bootVolumeVpusPerGB\":10}" \
+              --instance-options '{"areLegacyImdsEndpointsDisabled":true}' \
+              --availability-config '{"recoveryAction":"RESTORE_INSTANCE"}' \
+              --agent-config '{"areAllPluginsDisabled":false,"isManagementDisabled":false,"isMonitoringDisabled":false,"pluginsConfig":[{"desiredState":"DISABLED","name":"Vulnerability Scanning"},{"desiredState":"DISABLED","name":"OS Management Hub Agent"},{"desiredState":"DISABLED","name":"Management Agent"},{"desiredState":"ENABLED","name":"Custom Logs Monitoring"},{"desiredState":"DISABLED","name":"Compute RDMA GPU Monitoring"},{"desiredState":"ENABLED","name":"Compute Instance Monitoring"},{"desiredState":"DISABLED","name":"Compute HPC RDMA Auto-Configuration"},{"desiredState":"DISABLED","name":"Compute HPC RDMA Authentication"},{"desiredState":"ENABLED","name":"Cloud Guard Workload Protection"},{"desiredState":"DISABLED","name":"Block Volume Management"},{"desiredState":"DISABLED","name":"Bastion"}]}' \
+              --ssh-authorized-keys-file ~/.oci/oci_ssh.pub 2>&1)
+            STATUS=$?
+
+            if [ $STATUS -eq 0 ]; then
+              echo "🎉 SUCCESS: Instance provisioned!"
+              INSTANCE_ID=$(echo "$OUTPUT" | jq -r '.data.id // empty')
+              PUBLIC_IP=""
+
+              if [ -n "$INSTANCE_ID" ]; then
+                echo "Instance ID: $INSTANCE_ID"
+                echo "Waiting 15s for VNIC attachment to retrieve Public IP..."
+                sleep 15
+                PUBLIC_IP=$(oci compute instance list-vnics --instance-id "$INSTANCE_ID" --query "data[0].\"public-ip\"" --raw-output 2>/dev/null || echo "")
+              fi
+
+              # GitHub sends the run email itself, so the success message only
+              # needs to reach the Actions log. No webhook = no outbound call.
+              echo "::notice title=VM provisioned::${SHAPE} '${DISPLAY_NAME}' in ${REGION}. Public IP: ${PUBLIC_IP:-pending assignment}"
+              exit 0
+            fi
+
+            # Retry only genuine capacity / throttling / transient-network
+            # failures. Matching bare '500' etc. used to swallow real config
+            # errors and burn the whole 25 min budget on them.
+            if printf '%s' "$OUTPUT" | grep -qiE \
+              "out of host capacity|OutOfHostCapacity|TooManyRequests|LimitExceeded|InternalError|ConnectionError|ConnectionReset|NewConnectionError|RequestException|ReadTimeout|timed out|Temporary failure in name resolution|\"status\": 50[0-9]|\"status\": 429|Service Unavailable"; then
+              echo "⏳ Transient capacity/network error. Retrying shortly..."
+              echo "$OUTPUT" | head -20
+            else
+              echo "::error::FATAL: non-capacity error. Aborting to avoid burning runtime."
+              echo "$OUTPUT" | head -40
+              exit 1
+            fi
+
+            attempt=$((attempt + 1))
+            sleep $(( (RANDOM % 8) + 10 ))  # Jittered 10-17s sleep
+          done
+
+          echo "⚠️ Timed out after 25 minutes without securing capacity this cycle. Will retry on next scheduled cron run."
