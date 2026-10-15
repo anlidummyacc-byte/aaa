@@ -389,7 +389,32 @@ jobs:
             sleep $(( (RANDOM % 8) + 10 ))  # Jittered 10-17s sleep
           done
 
-          case "$(date -u +%H)" in
-            00|06|12|18) notify "⏳ Still trying: no A1 capacity yet in ${REGION} (${attempt} attempts this cycle). Will keep retrying." heartbeat ;;
-          esac
+          # End of a 25-minute cycle with no capacity. Message every cycle when the
+          # NOTIFY_ALL secret is "true"; otherwise only ~4 times a day.
+          LAST_ERR=$(printf '%s' "${OUTPUT:-}" | grep -m1 -oiE 'out of host capacity|TooManyRequests|LimitExceeded|InternalError' | head -1)
+          NOTIFY_ALL=$(printf '%s' "${{ secrets.NOTIFY_ALL }}" | tr -d '[:space:]')
+          STATUS_MSG="⏳ No capacity yet (${LAST_ERR:-no response}) in ${REGION}. ${attempt} attempts this cycle. Retrying automatically."
+          if [ "$NOTIFY_ALL" = "true" ]; then
+            notify "$STATUS_MSG" heartbeat
+          else
+            case "$(date -u +%H)" in
+              00|06|12|18) notify "$STATUS_MSG" heartbeat ;;
+            esac
+          fi
           echo "⚠️ Timed out after 25 minutes without securing capacity this cycle. Will retry on next scheduled cron run."
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -z "$WEBHOOK_URL" ] && exit 0
+          MSG="❌ OCI provisioner run FAILED. Check the log: ${RUN_URL}"
+          case "$WEBHOOK_URL" in
+            *macrodroid.com*)
+              curl -sS -m 15 -G --data-urlencode "msg=$MSG" --data-urlencode "event=error" "$WEBHOOK_URL" >/dev/null 2>&1 || true ;;
+            *)
+              curl -sS -m 15 -H 'Content-Type: application/json' \
+                -d "$(jq -n --arg m "$MSG" '{content:$m,text:$m}')" "$WEBHOOK_URL" >/dev/null 2>&1 || true ;;
+          esac
