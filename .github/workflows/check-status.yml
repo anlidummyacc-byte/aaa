@@ -1,63 +1,76 @@
-Skip to content
-anlidummyacc-byte
-aaa
-Repository navigation
-Code
-Issues
-Pull requests
-Actions
-Projects
-Wiki
-Security and quality
-Insights
-Settings
-.github/workflows/check-status.yml
-Update check-status.yml #2
-All jobs
-Run details
-Workflow file for this run
-.github/workflows/check-status.yml at 7f2ba2a
 ```yaml
- Check failure on line 1 in .github/workflows/check-status.yml
+name: Check OCI Status
 
-
-GitHub Actions
-/ .github/workflows/check-status.yml
-Invalid workflow file
-
-You have an error in your yaml syntax
-name: Check provisioner status
-on:
+'on':
   workflow_dispatch:
   schedule:
-    - cron: "*/2 * * * *"
+    - cron: "*/5 * * * *"
+
 permissions:
   actions: read
   contents: read
+
 jobs:
   status:
     runs-on: ubuntu-24.04
     steps:
-      - name: Check latest workflow runs
+      - name: Check latest OCI run
         env:
           GH_TOKEN: ${{ github.token }}
+          WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
           REPO: ${{ github.repository }}
         run: |
-          gh run list \
-            --repo "$REPO" \
-            --limit 10 \
-            --json name,status,conclusion,updatedAt \
-            --jq '.[] | select(.name != "Check provisioner status") | [.name, .status, (.conclusion // "none"), .updatedAt] | @tsv'
+          set -e
+
+          DATA=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/runs?per_page=50")
+
+          RUN=$(printf '%s' "$DATA" | jq -c \
+            '[.workflow_runs[]
+              | select(.name == "OCI Auto Provisioner (region from OCI_CONFIG)")]
+             | sort_by(.created_at) | last // empty')
+
+          if [ -z "$RUN" ]; then
+            MSG="📊 OCI STATUS
+          No provisioner runs found."
+          else
+            NAME=$(printf '%s' "$RUN" | jq -r '.name')
+            STATUS=$(printf '%s' "$RUN" | jq -r '.status')
+            RESULT=$(printf '%s' "$RUN" | jq -r '.conclusion // "running"')
+            UPDATED=$(printf '%s' "$RUN" | jq -r '.updated_at')
+            URL=$(printf '%s' "$RUN" | jq -r '.html_url')
+
+            MSG=$(printf '%s\n' \
+              "📊 OCI PROVISIONER STATUS" \
+              "━━━━━━━━━━━━━━━" \
+              "⚙️ Workflow: $NAME" \
+              "🔄 Status: $STATUS" \
+              "📌 Result: $RESULT" \
+              "🕒 Updated: $UPDATED" \
+              "🔗 Run: $URL")
+          fi
+
+          echo "$MSG"
+
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "::warning::Webhook secret is missing. Status printed only in logs."
+            exit 0
+          fi
+
+          case "$WEBHOOK_URL" in
+            *macrodroid.com*)
+              curl -fsS -m 15 -G \
+                --data-urlencode "event=status" \
+                --data-urlencode "msg=$MSG" \
+                "$WEBHOOK_URL"
+              ;;
+            *)
+              curl -fsS -m 15 \
+                -H 'Content-Type: application/json' \
+                -d "$(jq -n --arg m "$MSG" '{content:$m,text:$m}')" \
+                "$WEBHOOK_URL"
+              ;;
+          esac
 ```
-Footer
-© 2026 GitHub, Inc.
-Footer navigation
-Terms
-Privacy
-Security
-Status
-Community
-Docs
-Contact
-Manage cookies
-Do not share my personal information
