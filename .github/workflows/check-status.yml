@@ -14,7 +14,7 @@ jobs:
   status:
     runs-on: ubuntu-24.04
     steps:
-      - name: Check latest run
+      - name: Check latest workflow runs
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -22,7 +22,6 @@ jobs:
           gh run list \
             --repo "$REPO" \
             --limit 10 \
-            --json name,status,conclusion,createdAt,updatedAt \
-            --jq '.[] | select(.name != "Check provisioner status") |
-              "\(.name) | \(.status) | \(.conclusion // "running") | \(.updatedAt)"'
+            --json name,status,conclusion,updatedAt \
+            --jq '.[] | select(.name != "Check provisioner status") | [.name, .status, (.conclusion // "none"), .updatedAt] | @tsv'
 ```
