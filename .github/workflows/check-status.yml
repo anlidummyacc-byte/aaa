@@ -1,15 +1,39 @@
+Skip to content
+anlidummyacc-byte
+aaa
+Repository navigation
+Code
+Issues
+Pull requests
+Actions
+Projects
+Wiki
+Security and quality
+Insights
+Settings
+.github/workflows/check-status.yml
+Update check-status.yml #2
+All jobs
+Run details
+Workflow file for this run
+.github/workflows/check-status.yml at 7f2ba2a
 ```yaml
-name: Check provisioner status
+ Check failure on line 1 in .github/workflows/check-status.yml
 
+
+GitHub Actions
+/ .github/workflows/check-status.yml
+Invalid workflow file
+
+You have an error in your yaml syntax
+name: Check provisioner status
 on:
   workflow_dispatch:
   schedule:
     - cron: "*/2 * * * *"
-
 permissions:
   actions: read
   contents: read
-
 jobs:
   status:
     runs-on: ubuntu-24.04
@@ -25,3 +49,15 @@ jobs:
             --json name,status,conclusion,updatedAt \
             --jq '.[] | select(.name != "Check provisioner status") | [.name, .status, (.conclusion // "none"), .updatedAt] | @tsv'
 ```
+Footer
+© 2026 GitHub, Inc.
+Footer navigation
+Terms
+Privacy
+Security
+Status
+Community
+Docs
+Contact
+Manage cookies
+Do not share my personal information
