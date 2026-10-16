@@ -1,6 +1,8 @@
-name: Check OCI Status
+name: OCI Status and History Report
 
 on:
+  schedule:
+    - cron: "17 */5 * * *"
   workflow_dispatch:
 
 permissions:
@@ -8,64 +10,84 @@ permissions:
   contents: read
 
 jobs:
-  status:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-
+  report:
+    runs-on: ubuntu-latest
     steps:
-      - name: Check status every minute
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Send status and full history
         env:
           GH_TOKEN: ${{ github.token }}
           WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
           REPO: ${{ github.repository }}
         run: |
-          for i in $(seq 1 360); do
-            DATA=$(curl -fsSL \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/actions/runs?per_page=50")
+          set -e
 
-            RUN=$(echo "$DATA" | jq -c \
-              '[.workflow_runs[]
-               | select(.name == "OCI Auto Provisioner (region from OCI_CONFIG)")]
-               | sort_by(.created_at) | last // empty')
+          DATA=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/runs?per_page=100")
 
-            if [ -z "$RUN" ]; then
-              MSG="⚠️ OCI STATUS: No provisioning run found."
+          RUN=$(echo "$DATA" | jq -c \
+            '[.workflow_runs[]
+             | select(.name == "OCI Auto Provisioner (region from OCI_CONFIG)")]
+             | sort_by(.created_at) | last // empty')
+
+          if [ -z "$RUN" ]; then
+            STATUS="No provisioning run found"
+            RESULT="Unknown"
+            RUN_URL="N/A"
+          else
+            STATUS=$(echo "$RUN" | jq -r '.status')
+            RESULT=$(echo "$RUN" | jq -r '.conclusion // "running"')
+            RUN_URL=$(echo "$RUN" | jq -r '.html_url')
+          fi
+
+          {
+            echo "📊 OCI STATUS REPORT"
+            echo "━━━━━━━━━━━━━━━━━━"
+            echo "Status: $STATUS"
+            echo "Result: $RESULT"
+            echo "Run: $RUN_URL"
+            echo ""
+            echo "📜 COMPLETE PROVISIONING HISTORY"
+            echo "━━━━━━━━━━━━━━━━━━"
+            if [ -f history.log ]; then
+              cat history.log
             else
-              STATUS=$(echo "$RUN" | jq -r '.status')
-              RESULT=$(echo "$RUN" | jq -r '.conclusion // "running"')
-
-              if [ "$RESULT" = "success" ]; then
-                echo "✅ Provisioning succeeded. Stopping checks."
-                exit 0
-              elif [ "$STATUS" = "in_progress" ]; then
-                MSG="⏳ OCI UPDATE: Provisioning is still running. No confirmed success yet."
-              elif [ "$RESULT" = "failure" ]; then
-                MSG="⚠️ OCI UPDATE: Provisioning failed. No confirmed success yet."
-              else
-                MSG="ℹ️ OCI UPDATE: Latest run status is $STATUS, result is $RESULT."
-              fi
+              echo "No history.log file found."
             fi
+          } > report.txt
 
-            echo "$MSG"
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "::error::NOTIFY_WEBHOOK_URL secret is missing."
+            exit 1
+          fi
 
-            if [ -n "$WEBHOOK_URL" ]; then
-              case "$WEBHOOK_URL" in
-                *macrodroid.com*)
-                  curl -fsS -m 15 -G \
-                    --data-urlencode "event=status" \
-                    --data-urlencode "msg=$MSG" \
-                    "$WEBHOOK_URL" || true
-                  ;;
-                *)
-                  curl -fsS -m 15 \
-                    -H 'Content-Type: application/json' \
-                    -d "$(jq -n --arg m "$MSG" '{content:$m,text:$m}')" \
-                    "$WEBHOOK_URL" || true
-                  ;;
-              esac
-            fi
+          # Split into readable messages to avoid webhook size limits.
+          split -l 25 -d -a 4 report.txt report_part_
 
-            sleep 60
+          for PART in report_part_*; do
+            MSG=$(cat "$PART")
+
+            case "$WEBHOOK_URL" in
+              *macrodroid.com*)
+                curl -fsS -m 20 -G \
+                  --data-urlencode "event=status" \
+                  --data-urlencode "msg=$MSG" \
+                  "$WEBHOOK_URL"
+                ;;
+              *)
+                curl -fsS -m 20 \
+                  -H "Content-Type: application/json" \
+                  -d "$(jq -n --arg m "$MSG" \
+                    '{content:$m,text:$m}')" \
+                  "$WEBHOOK_URL"
+                ;;
+            esac
+
+            sleep 2
           done
+
+          echo "Status and history report sent."
